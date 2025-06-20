@@ -1,0 +1,643 @@
+version: '3.8'
+
+# Decentralized Enterprise AI Agent Platform (DEAAP)
+# 
+# USAGE:
+#   Development Mode: docker compose --profile development up
+#   Production Mode:  docker compose --profile production up
+#   Testing Mode:     docker compose --profile development --profile production up
+#
+# The profiles ensure appropriate services are started for each deployment mode:
+# - Development mode uses simulated validation for rapid development
+# - Production mode uses full Cartesi-based validation with consensus
+# - Both modes can run simultaneously for comparison and migration testing
+
+services:
+  # =============================================================================
+  # INFRASTRUCTURE SERVICES
+  # =============================================================================
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: deaap-postgres
+    environment:
+      POSTGRES_DB: deaap
+      POSTGRES_USER: deaap_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-deaap_password}
+      POSTGRES_MULTIPLE_DATABASES: "authorization,agents,consensus,audit"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-postgres.sql:/docker-entrypoint-initdb.d/init-postgres.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - deaap-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deaap_user -d deaap"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  # Redis Cache and Message Broker
+  redis:
+    image: redis:7-alpine
+    container_name: deaap-redis
+    command: redis-server --requirepass ${REDIS_PASSWORD:-deaap_redis}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - deaap-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # =============================================================================
+  # BLOCKCHAIN & CONSENSUS LAYER
+  # =============================================================================
+
+  # Local Blockchain Node
+  blockchain:
+    build:
+      context: ./blockchain
+      dockerfile: Dockerfile
+    container_name: deaap-blockchain
+    environment:
+      - NETWORK_ID=31337
+      - CHAIN_ID=31337
+      - BLOCK_TIME=12
+      - GAS_LIMIT=30000000
+      - CONSENSUS_ALGORITHM=proof-of-authority
+    volumes:
+      - blockchain_data:/data
+      - ./blockchain/genesis.json:/genesis.json:ro
+      - ./blockchain/keystore:/keystore:ro
+    ports:
+      - "8545:8545"
+      - "30303:30303"
+      - "8546:8546"
+    networks:
+      - deaap-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8545"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # Consensus Manager
+  consensus-manager:
+    build:
+      context: ./services/consensus-manager
+      dockerfile: Dockerfile
+    container_name: deaap-consensus-manager
+    environment:
+      - BLOCKCHAIN_RPC=http://blockchain:8545
+      - DATABASE_URL=postgresql://deaap_user:${POSTGRES_PASSWORD:-deaap_password}@postgres:5432/consensus
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-deaap_redis}@redis:6379
+      - MIN_VALIDATORS=3
+      - CONSENSUS_THRESHOLD=0.67
+      - VALIDATION_TIMEOUT=300
+    volumes:
+      - ./services/consensus-manager:/app
+      - ./blockchain/contracts:/app/contracts:ro
+      - consensus_data:/app/data
+    ports:
+      - "8760:8760"
+      - "8761:8761"
+    networks:
+      - deaap-network
+    depends_on:
+      blockchain:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # =============================================================================
+  # DOCUMENT PROCESSING LAYER
+  # =============================================================================
+
+  # Document Ingester Service
+  doc-ingester:
+    build:
+      context: ./services/doc-ingester
+      dockerfile: Dockerfile
+    container_name: deaap-doc-ingester
+    environment:
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-deaap_redis}@redis:6379
+      - POSTGRES_URL=postgresql://deaap_user:${POSTGRES_PASSWORD:-deaap_password}@postgres:5432/deaap
+      - MINERU_SERVICE_URL=http://mineru:8753
+      - YY_CHUNKER_URL=http://yy-chunker:8754
+      - MAX_FILE_SIZE=100MB
+    volumes:
+      - ./services/doc-ingester:/app
+      - ./data/uploads:/app/uploads
+      - ./data/results:/app/results
+    ports:
+      - "8752:8752"
+    networks:
+      - deaap-network
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  # Mineru PDF Processing Engine
+  mineru:
+    build:
+      context: ./services/mineru
+      dockerfile: Dockerfile
+    container_name: deaap-mineru
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=all
+      - MODEL_CACHE_DIR=/app/models
+      - TEMP_DIR=/app/temp
+      - MAX_PAGES_PER_REQUEST=50
+    volumes:
+      - ./services/mineru:/app
+      - ./data/models:/app/models
+      - ./data/temp:/app/temp
+    ports:
+      - "8753:8753"
+    networks:
+      - deaap-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # YY-Chunker Service
+  yy-chunker:
+    build:
+      context: ./services/yy-chunker
+      dockerfile: Dockerfile
+    container_name: deaap-yy-chunker
+    environment:
+      - DEFAULT_CHUNK_SIZE=2100
+      - DEFAULT_OVERLAP=200
+      - CHUNKER_METHODS=semantic,fixed_token,recursive,markdown
+      - EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
+    volumes:
+      - ./services/yy-chunker:/app
+      - ./data/chunks:/app/chunks
+    ports:
+      - "8754:8754"
+    networks:
+      - deaap-network
+
+  # =============================================================================
+  # DATA PROCESSING LAYER
+  # =============================================================================
+
+  # Synthetic Dataset Generator
+  synthetic-data:
+    build:
+      context: ./services/synthetic-data
+      dockerfile: Dockerfile
+    container_name: deaap-synthetic-data
+    environment:
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
+      - DATASET_FORMATS=alpaca,sharegpt,instruction
+      - SYNTHETIC_RATIO=3
+      - QUALITY_THRESHOLD=0.8
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      - ./services/synthetic-data:/app
+      - ./data/datasets:/app/datasets
+    ports:
+      - "8755:8755"
+    networks:
+      - deaap-network
+    depends_on:
+      - yy-chunker
+
+  # Embedding Generator
+  embedding-service:
+    build:
+      context: ./services/embedding-service
+      dockerfile: Dockerfile
+    container_name: deaap-embedding-service
+    environment:
+      - EMBEDDING_MODEL=sentence-transformers/all-mpnet-base-v2
+      - BATCH_SIZE=32
+      - VECTOR_DIMENSION=768
+      - SIMILARITY_THRESHOLD=0.7
+    volumes:
+      - ./services/embedding-service:/app
+      - ./data/embeddings:/app/embeddings
+      - ./data/models:/app/models
+    ports:
+      - "8756:8756"
+    networks:
+      - deaap-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # Vector Database (Qdrant)
+  vector-db:
+    image: qdrant/qdrant:v1.7.0
+    container_name: deaap-vector-db
+    environment:
+      - QDRANT__SERVICE__HTTP_PORT=6333
+      - QDRANT__SERVICE__GRPC_PORT=6334
+      - QDRANT__STORAGE__STORAGE_PATH=/qdrant/storage
+      - QDRANT__SERVICE__MAX_REQUEST_SIZE_MB=128
+    volumes:
+      - vector_db_data:/qdrant/storage
+      - ./configs/qdrant:/qdrant/config:ro    ports:
+      - "8774:6333"
+      - "8775:6334"
+    networks:
+      - deaap-network
+
+  # Vector Database Service (API Layer)
+  vector-database:
+    build:
+      context: ./services/vector-database
+      dockerfile: Dockerfile
+    container_name: deaap-vector-database
+    environment:
+      - DATABASE_URL=postgresql://deaap_user:${POSTGRES_PASSWORD:-deaap_password}@postgres:5432/deaap
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-deaap_redis}@redis:6379
+      - QDRANT_HOST=vector-db
+      - QDRANT_PORT=6333
+      - EMBEDDING_MODEL=sentence-transformers/all-mpnet-base-v2
+      - VECTOR_DIMENSION=768
+      - AUTHORIZATION_SERVICE_URL=http://authorization:8763
+    volumes:
+      - ./services/vector-database:/app
+      - ./data/embeddings:/app/embeddings
+      - ./data/models:/app/models
+    ports:
+      - "8778:8774"
+    networks:
+      - deaap-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      vector-db:
+        condition: service_started
+      authorization:
+        condition: service_started
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # =============================================================================
+  # VALIDATION LAYER - DEVELOPMENT MODE
+  # =============================================================================
+
+  # Mock Validator (Development Mode)
+  mock-validator:
+    profiles: ["development"]
+    build:
+      context: ./services/mock-validator
+      dockerfile: Dockerfile
+    container_name: deaap-mock-validator
+    environment:
+      - CONSENSUS_MANAGER_URL=http://consensus-manager:8760
+      - VALIDATION_MODE=mock
+      - APPROVAL_RATE=0.8
+      - RESPONSE_DELAY=5
+    volumes:
+      - ./services/mock-validator:/app
+    ports:
+      - "8762:8762"
+    networks:
+      - deaap-network
+    depends_on:
+      - consensus-manager
+
+  # =============================================================================
+  # VALIDATION LAYER - PRODUCTION MODE
+  # =============================================================================
+
+  # Cartesi Runtime for Production Validation
+  cartesi-runtime:
+    profiles: ["production"]
+    image: cartesi/rollups-node:1.5.1
+    container_name: deaap-cartesi-runtime
+    environment:
+      - CARTESI_BLOCKCHAIN_RPC_URL=http://blockchain:8545
+      - CARTESI_EPOCH_DURATION=3600
+      - CARTESI_BLOCKCHAIN_BLOCK_TIMEOUT=60
+      - CARTESI_LOG_LEVEL=info
+    volumes:
+      - ./services/cartesi-runtime:/opt/cartesi/dapp
+      - ./validator-logic:/opt/cartesi/logic:ro
+      - cartesi_data:/opt/cartesi/share
+    ports:
+      - "5006:5006"
+      - "8080:8080"
+    networks:
+      - deaap-network
+    depends_on:
+      blockchain:
+        condition: service_healthy
+
+  # BU Validator Template (Production Mode)
+  bu-validator:
+    profiles: ["production"]
+    build:
+      context: ./services/bu-validator
+      dockerfile: Dockerfile
+    environment:
+      - BU_NAME=${BU_NAME:-default-bu}
+      - BU_WALLET_ADDRESS=${BU_WALLET_ADDRESS}
+      - VALIDATION_LOGIC_PATH=/app/logic/validation.py
+      - CARTESI_MODE=production
+      - BLOCKCHAIN_RPC=http://blockchain:8545
+      - CONSENSUS_MANAGER_URL=http://consensus-manager:8760
+    volumes:
+      - ./services/bu-validator:/app
+      - ./validator-logic/${BU_NAME:-default-bu}:/app/logic:ro
+      - ./data/validator/${BU_NAME:-default-bu}:/app/data
+    ports:
+      - "8762:8762"
+    networks:
+      - deaap-network
+    depends_on:
+      - consensus-manager
+      - cartesi-runtime
+    secrets:
+      - bu_private_key
+
+  # =============================================================================
+  # AUTHORIZATION & ORCHESTRATION LAYER
+  # =============================================================================
+
+  # Authorization Service
+  authorization:
+    build:
+      context: ./services/authorization
+      dockerfile: Dockerfile
+    container_name: deaap-authorization
+    environment:
+      - DATABASE_URL=postgresql://deaap_user:${POSTGRES_PASSWORD:-deaap_password}@postgres:5432/authorization
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-deaap_redis}@redis:6379
+      - BLOCKCHAIN_RPC=http://blockchain:8545
+      - CONSENSUS_MANAGER_URL=http://consensus-manager:8760
+      - POLICY_ENGINE=opa
+      - AUDIT_ENABLED=true
+    volumes:
+      - ./services/authorization:/app
+      - ./data/auth:/app/data
+      - ./configs/policies:/app/policies:ro
+    ports:
+      - "8763:8763"
+    networks:
+      - deaap-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      consensus-manager:
+        condition: service_started
+
+  # Agent Orchestrator
+  agent-orchestrator:
+    build:
+      context: ./services/agent-orchestrator
+      dockerfile: Dockerfile
+    container_name: deaap-agent-orchestrator
+    environment:
+      - DATABASE_URL=postgresql://deaap_user:${POSTGRES_PASSWORD:-deaap_password}@postgres:5432/agents
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-deaap_redis}@redis:6379
+      - AUTHORIZATION_SERVICE_URL=http://authorization:8763
+      - LLM_RUNTIME_URL=http://llm-runtime:8772
+      - RAG_ENGINE_URL=http://rag-engine:8773
+      - VECTOR_DB_URL=http://vector-db:8774
+      - AGENT_TIMEOUT=3600
+      - MAX_CONCURRENT_AGENTS=10
+    volumes:
+      - ./services/agent-orchestrator:/app
+      - ./data/agents:/app/agents
+      - ./configs/agent-templates:/app/templates:ro
+    ports:
+      - "8770:8770"
+      - "8771:8771"
+    networks:
+      - deaap-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      authorization:
+        condition: service_started
+
+  # =============================================================================
+  # LLM RUNTIME LAYER
+  # =============================================================================
+
+  # LLM Runtime Service
+  llm-runtime:
+    build:
+      context: ./services/llm-runtime
+      dockerfile: Dockerfile
+    container_name: deaap-llm-runtime
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=all
+      - MODEL_CACHE_DIR=/app/models
+      - ADAPTOR_CACHE_DIR=/app/adaptors
+      - BASE_MODELS=llama-2-7b,llama-2-13b,codellama-7b
+      - MAX_SEQUENCE_LENGTH=4096
+      - BATCH_SIZE=8
+      - INFERENCE_ENGINE=vllm
+    volumes:
+      - ./services/llm-runtime:/app
+      - ./data/models:/app/models
+      - ./data/lora-adaptors:/app/adaptors
+      - ./data/cache:/app/cache
+    ports:
+      - "8772:8772"
+    networks:
+      - deaap-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # RAG Engine
+  rag-engine:
+    build:
+      context: ./services/rag-engine
+      dockerfile: Dockerfile
+    container_name: deaap-rag-engine
+    environment:
+      - VECTOR_DB_URL=http://vector-db:6333
+      - EMBEDDING_MODEL=sentence-transformers/all-mpnet-base-v2
+      - RETRIEVAL_TOP_K=10
+      - RERANKING_MODEL=cross-encoder/ms-marco-MiniLM-L-12-v2
+      - MAX_CONTEXT_LENGTH=8192
+      - SIMILARITY_THRESHOLD=0.7
+    volumes:
+      - ./services/rag-engine:/app
+      - ./data/embeddings:/app/embeddings:ro
+      - ./data/documents:/app/documents:ro
+    ports:
+      - "8773:8773"
+    networks:
+      - deaap-network
+    depends_on:
+      - vector-db
+
+  # =============================================================================
+  # MONITORING & MANAGEMENT
+  # =============================================================================
+
+  # Agent Manager
+  agent-manager:
+    build:
+      context: ./services/agent-manager
+      dockerfile: Dockerfile
+    container_name: deaap-agent-manager
+    environment:
+      - AGENT_ORCHESTRATOR_URL=http://agent-orchestrator:8770
+      - PROMETHEUS_URL=http://prometheus:9090
+      - LOG_LEVEL=info
+      - HEALTH_CHECK_INTERVAL=30
+      - SCALING_THRESHOLD_CPU=80
+    volumes:
+      - ./services/agent-manager:/app
+      - ./data/agent-instances:/app/instances
+      - ./logs/agents:/app/logs
+    ports:
+      - "8776:8776"
+      - "8777:8777"
+    networks:
+      - deaap-network
+    depends_on:
+      - agent-orchestrator
+  # API Gateway
+  api-gateway:
+    build:
+      context: ./services/api-gateway
+      dockerfile: Dockerfile
+    container_name: deaap-api-gateway
+    environment:
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-deaap_redis}@redis:6379
+      - JWT_SECRET=${JWT_SECRET:-deaap-jwt-secret-key}
+      - AUTHORIZATION_SERVICE_URL=http://authorization:8763
+      - DOC_INGESTER_URL=http://doc-ingester:8752
+      - YY_CHUNKER_URL=http://yy-chunker:8754
+      - CONSENSUS_MANAGER_URL=http://consensus-manager:8760
+      - AGENT_ORCHESTRATOR_URL=http://agent-orchestrator:8770
+      - VECTOR_DATABASE_URL=http://vector-database:8774
+      - DATA_PROCESSOR_URL=http://data-processor:8751
+      - BU_VALIDATOR_URL=http://bu-validator:8762
+      - LLM_RUNTIME_URL=http://llm-runtime:8772
+      - RAG_ENGINE_URL=http://rag-engine:8773
+      - RATE_LIMIT_REQUESTS=1000
+      - RATE_LIMIT_WINDOW=3600
+    volumes:
+      - ./services/api-gateway:/app
+      - ./configs/gateway:/app/config:ro
+    ports:
+      - "8765:8765"
+    networks:
+      - deaap-network
+    depends_on:
+      redis:
+        condition: service_healthy
+      authorization:
+        condition: service_started
+      doc-ingester:
+        condition: service_started
+      agent-orchestrator:
+        condition: service_started
+
+  # Web Interface
+  web-interface:
+    build:
+      context: ./services/web-interface
+      dockerfile: Dockerfile
+    container_name: deaap-web-interface
+    environment:
+      - REACT_APP_API_URL=http://localhost:8080
+      - REACT_APP_WS_URL=ws://localhost:8080
+    volumes:
+      - ./services/web-interface:/app
+      - web_node_modules:/app/node_modules
+    ports:
+      - "3000:3000"
+    networks:
+      - deaap-network
+    depends_on:
+      - api-gateway
+
+# =============================================================================
+# NETWORKS
+# =============================================================================
+
+networks:
+  deaap-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+
+volumes:
+  # Database volumes
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  
+  # Blockchain volumes
+  blockchain_data:
+    driver: local
+  consensus_data:
+    driver: local
+  
+  # Cartesi volumes
+  cartesi_data:
+    driver: local
+  
+  # Vector database volume
+  vector_db_data:
+    driver: local
+  
+  # Web interface node modules
+  web_node_modules:
+    driver: local
+
+# =============================================================================
+# SECRETS
+# =============================================================================
+
+secrets:
+  bu_private_key:
+    file: ./secrets/bu_private_key.txt
